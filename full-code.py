@@ -1,207 +1,220 @@
-import tkinter as tk
-from tkinter import filedialog, ttk
-from PIL import Image, ImageTk
+import sys
+import os
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                           QHBoxLayout, QPushButton, QLabel, QFileDialog, QScrollArea)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap
 import pytesseract
-import pdf2image
-import fitz
+import fitz  # PyMuPDF
 import cv2
 import numpy as np
-import os
+from language_tool_python import LanguageTool
 
-class OCRViewer:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("OCR Document Viewer")
-        
-        self.main_frame = ttk.Frame(root)
-        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        self.select_button = ttk.Button(
-            self.main_frame,
-            text="Select PDF/Image",
-            command=self.select_file
-        )
-        self.select_button.pack(pady=10)
-        
-        self.create_display_windows()
-        self.text_boxes = []  # Store references to text boxes
-        
-    def create_display_windows(self):
-        # Create windows
-        self.windows = {
-            'original': self.create_window("Original Document"),
-            'overlay': self.create_window("Interactive Text Overlay"),
-            'corrected': self.create_window("Corrected Text Overlay")
-        }
-        
-        # Create canvases
-        for name, window in self.windows.items():
-            # Create a frame with scrollbars
-            frame = ttk.Frame(window)
-            frame.pack(fill=tk.BOTH, expand=True)
-            
-            # Create canvas with scrollbars
-            canvas = tk.Canvas(frame, bg='white')
-            v_scroll = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-            h_scroll = ttk.Scrollbar(frame, orient="horizontal", command=canvas.xview)
-            
-            # Configure canvas scrolling
-            canvas.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
-            
-            # Grid layout for canvas and scrollbars
-            canvas.grid(row=0, column=0, sticky="nsew")
-            v_scroll.grid(row=0, column=1, sticky="ns")
-            h_scroll.grid(row=1, column=0, sticky="ew")
-            
-            # Configure grid weights
-            frame.grid_rowconfigure(0, weight=1)
-            frame.grid_columnconfigure(0, weight=1)
-            
-            setattr(self, f"{name}_canvas", canvas)
-            
-            # Bind mouse wheel events
-            canvas.bind('<Configure>', lambda e, c=canvas: self.on_canvas_configure(c))
-            canvas.bind_all("<MouseWheel>", lambda e, c=canvas: self.on_mousewheel(e, c))
+class OCRWorker(QThread):
+    finished = pyqtSignal(str)
     
-    def create_window(self, title):
-        window = tk.Toplevel(self.root)
-        window.title(title)
-        window.geometry("800x600")
-        return window
+    def __init__(self, image):
+        super().__init__()
+        self.image = image
+        
+    def run(self):
+        try:
+            # Ensure image is in the correct format for Tesseract
+            if isinstance(self.image, np.ndarray):
+                # Convert to grayscale if it's not already
+                if len(self.image.shape) == 3:
+                    gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+                else:
+                    gray = self.image
+                # Improve image quality for OCR
+                gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+                text = pytesseract.image_to_string(gray)
+            else:
+                raise ValueError(f"Unsupported image type: {type(self.image)}")
+            self.finished.emit(text)
+        except Exception as e:
+            self.finished.emit(f"Error: {str(e)}")
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Document OCR Viewer")
+        self.setMinimumSize(1200, 800)
+        
+        # Initialize language tool for grammar correction
+        self.language_tool = LanguageTool('en-US')
+        
+        # Main widget and layout
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        layout = QVBoxLayout(main_widget)
+        
+        # Add upload button
+        upload_btn = QPushButton("Upload Document")
+        upload_btn.clicked.connect(self.upload_document)
+        layout.addWidget(upload_btn)
+        
+        # Status label
+        self.status_label = QLabel()
+        layout.addWidget(self.status_label)
+        
+        # Create viewers container
+        viewers_container = QHBoxLayout()
+        
+        # Create and set up viewers similar to before...
+        self.setup_viewers(viewers_container)
+        
+        layout.addLayout(viewers_container)
+
+    def setup_viewers(self, container):
+        # Original document viewer
+        self.original_viewer = QScrollArea()
+        self.original_viewer.setWidgetResizable(True)
+        self.original_label = QLabel()
+        self.original_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.original_viewer.setWidget(self.original_label)
+        
+        # OCR text viewer
+        self.ocr_viewer = QScrollArea()
+        self.ocr_viewer.setWidgetResizable(True)
+        self.ocr_text = QLabel()
+        self.ocr_text.setWordWrap(True)
+        self.ocr_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.ocr_viewer.setWidget(self.ocr_text)
+        
+        # Corrected text viewer
+        self.corrected_viewer = QScrollArea()
+        self.corrected_viewer.setWidgetResizable(True)
+        self.corrected_text = QLabel()
+        self.corrected_text.setWordWrap(True)
+        self.corrected_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.corrected_viewer.setWidget(self.corrected_text)
+        
+        # Add viewers with labels
+        for viewer, title in [
+            (self.original_viewer, "Original Document"),
+            (self.ocr_viewer, "OCR Text"),
+            (self.corrected_viewer, "Corrected Text")
+        ]:
+            layout = QVBoxLayout()
+            layout.addWidget(QLabel(title))
+            layout.addWidget(viewer)
+            container.addLayout(layout)
     
-    def on_canvas_configure(self, canvas):
-        canvas.configure(scrollregion=canvas.bbox("all"))
-    
-    def on_mousewheel(self, event, canvas):
-        canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-    
-    def select_file(self):
-        file_path = filedialog.askopenfilename(
-            filetypes=[("PDF and Image files", "*.pdf *.png *.jpg *.jpeg *.tiff *.bmp")]
-        )
-        if file_path:
-            self.process_file(file_path)
-    
-    def process_file(self, file_path):
-        file_extension = os.path.splitext(file_path)[1].lower()
-        
-        # Clear existing text boxes
-        self.clear_text_boxes()
-        
-        if file_extension == '.pdf':
-            self.process_pdf(file_path)
-        else:
-            self.process_image(file_path)
-    
-    def clear_text_boxes(self):
-        for box in self.text_boxes:
-            box.destroy()
-        self.text_boxes = []
-    
-    def process_pdf(self, pdf_path):
-        doc = fitz.open(pdf_path)
-        page = doc[0]  # Process first page for demonstration
-        
-        # Get page as image
-        pix = page.get_pixmap()
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        
-        # Display original image
-        self.display_image(img)
-        
-        # Get words with their positions
-        words = page.get_text("words")
-        self.create_text_overlays(words)
-    
-    def process_image(self, image_path):
-        img = Image.open(image_path)
-        
-        # Display original image
-        self.display_image(img)
-        
-        # Perform OCR with position information
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-        self.create_text_overlays_from_ocr(data)
-    
-    def display_image(self, img):
-        # Resize image while maintaining aspect ratio
-        display_width = 780
-        ratio = display_width / img.width
-        display_height = int(img.height * ratio)
-        self.scale_factor = ratio
-        
-        img_resized = img.resize((display_width, display_height), Image.Resampling.LANCZOS)
-        
-        # Display in all windows
-        for name in ['original', 'overlay', 'corrected']:
-            canvas = getattr(self, f"{name}_canvas")
-            photo = ImageTk.PhotoImage(img_resized)
-            canvas.delete("all")
-            canvas.create_image(0, 0, anchor=tk.NW, image=photo)
-            setattr(self, f"{name}_photo", photo)
+    def process_pdf(self, file_path):
+        try:
+            self.status_label.setText("Processing PDF...")
             
-            # Update scroll region
-            canvas.configure(scrollregion=canvas.bbox("all"))
+            # Open PDF
+            doc = fitz.open(file_path)
+            page = doc[0]
+            
+            # Convert PDF page to image with higher resolution
+            zoom = 2.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+            
+            # Convert pixmap to numpy array
+            # Get image data as bytes
+            img_data = bytes(pix.samples)
+            
+            # Create numpy array from bytes
+            np_arr = np.frombuffer(img_data, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+            
+            # Display original
+            height, width, channel = np_arr.shape
+            bytes_per_line = 3 * width
+            q_img = QImage(np_arr.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
+            pixmap = QPixmap.fromImage(q_img)
+            
+            scaled_pixmap = pixmap.scaled(
+                self.original_viewer.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.original_label.setPixmap(scaled_pixmap)
+            
+            # Start OCR in separate thread
+            self.ocr_worker = OCRWorker(np_arr)
+            self.ocr_worker.finished.connect(self.handle_ocr_result)
+            self.ocr_worker.start()
+            
+            doc.close()
+            self.status_label.setText("PDF processing initiated...")
+            
+        except Exception as e:
+            self.status_label.setText(f"Error processing PDF: {str(e)}")
+            print(f"Detailed error: {str(e)}")
     
-    def create_text_overlays(self, words):
-        for word in words:
-            x0, y0, x1, y1, text = word[:5]
+    def process_image(self, file_path):
+        try:
+            self.status_label.setText("Processing image...")
+            # Read image
+            img = cv2.imread(file_path)
+            if img is None:
+                raise ValueError("Failed to load image")
             
-            # Scale coordinates according to display size
-            x0 *= self.scale_factor
-            y0 *= self.scale_factor
-            x1 *= self.scale_factor
-            y1 *= self.scale_factor
+            # Convert to RGB for display
+            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
-            # Create text entry for overlay window
-            text_box = tk.Entry(self.overlay_canvas, bd=0, highlightthickness=0)
-            text_box.insert(0, text)
-            text_box.configure(width=len(text))
+            # Create QImage
+            h, w, ch = rgb_img.shape
+            bytes_per_line = ch * w
+            qt_img = QImage(rgb_img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
             
-            # Position text box on canvas
-            self.overlay_canvas.create_window(x0, y0, window=text_box, anchor="nw")
-            self.text_boxes.append(text_box)
+            # Display image
+            pixmap = QPixmap.fromImage(qt_img)
+            scaled_pixmap = pixmap.scaled(
+                self.original_viewer.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.original_label.setPixmap(scaled_pixmap)
             
-            # Create similar text box for corrected window
-            corrected_box = tk.Entry(self.corrected_canvas, bd=0, highlightthickness=0)
-            corrected_box.insert(0, text)
-            corrected_box.configure(width=len(text))
+            # Process OCR
+            self.ocr_worker = OCRWorker(img)
+            self.ocr_worker.finished.connect(self.handle_ocr_result)
+            self.ocr_worker.start()
             
-            # Position text box on canvas
-            self.corrected_canvas.create_window(x0, y0, window=corrected_box, anchor="nw")
-            self.text_boxes.append(corrected_box)
+            self.status_label.setText("Image processing initiated...")
+            
+        except Exception as e:
+            self.status_label.setText(f"Error processing image: {str(e)}")
+            print(f"Detailed error: {str(e)}")
     
-    def create_text_overlays_from_ocr(self, data):
-        n_boxes = len(data['text'])
-        for i in range(n_boxes):
-            if int(data['conf'][i]) > 60:  # Filter low-confidence results
-                x = data['left'][i] * self.scale_factor
-                y = data['top'][i] * self.scale_factor
-                text = data['text'][i]
+    def handle_ocr_result(self, text):
+        try:
+            if text.startswith("Error:"):
+                self.status_label.setText(text)
+                return
                 
-                if text.strip():  # Only process non-empty text
-                    # Create text entry for overlay window
-                    text_box = tk.Entry(self.overlay_canvas, bd=0, highlightthickness=0)
-                    text_box.insert(0, text)
-                    text_box.configure(width=len(text))
-                    
-                    # Position text box on canvas
-                    self.overlay_canvas.create_window(x, y, window=text_box, anchor="nw")
-                    self.text_boxes.append(text_box)
-                    
-                    # Create similar text box for corrected window
-                    corrected_box = tk.Entry(self.corrected_canvas, bd=0, highlightthickness=0)
-                    corrected_box.insert(0, text)
-                    corrected_box.configure(width=len(text))
-                    
-                    # Position text box on canvas
-                    self.corrected_canvas.create_window(x, y, window=corrected_box, anchor="nw")
-                    self.text_boxes.append(corrected_box)
+            # Display OCR text
+            self.ocr_text.setText(text)
+            
+            # Perform grammar correction
+            corrected = self.language_tool.correct(text)
+            self.corrected_text.setText(corrected)
+            self.status_label.setText("Processing completed successfully!")
+        except Exception as e:
+            self.status_label.setText(f"Error in post-processing: {str(e)}")
+            print(f"Detailed error: {str(e)}")
 
-def main():
-    root = tk.Tk()
-    app = OCRViewer(root)
-    root.mainloop()
+    def upload_document(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Document",
+            "",
+            "Documents (*.pdf *.png *.jpg *.jpeg *.tiff)"
+        )
+        
+        if file_path:
+            if file_path.lower().endswith('.pdf'):
+                self.process_pdf(file_path)
+            else:
+                self.process_image(file_path)
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
